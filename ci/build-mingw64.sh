@@ -305,7 +305,7 @@ _harfbuzz () {
 _harfbuzz_mark=lib/libharfbuzz.dll.a
 
 _libass () {
-    [ -d libass ] || $gitclone https://github.com/libass/libass.git
+    [ -d libass ] || $gitclone --branch mangetsu https://github.com/amanosatosi/libassmod.git libass
     builddir libass
     meson setup .. --cross-file "$prefix_dir/crossfile"
     makeplusinstall
