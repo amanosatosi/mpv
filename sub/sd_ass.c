@@ -777,14 +777,27 @@ static struct sub_bitmaps *get_bitmaps(struct sd *sd, struct mp_osd_res dim,
         fill_plaintext(sd, pts);
 
     int changed;
+#ifdef LIBASSMOD_FEATURE_RGBA
+    ASS_RenderResult result = ass_render_frame_compat(renderer, track, ts, &changed);
+    if (result.use_rgba) {
+        MP_VERBOSE(sd, "libassmod: using RGBA subtitle render path.\n");
+        mp_sub_packer_pack_ass_rgba(ctx->packer, result.imgs_rgba, changed,
+                                    !converted, res);
+    } else {
+        mp_sub_packer_pack_ass(ctx->packer, &result.imgs, 1, changed,
+                               !converted, format, res);
+    }
+    ass_render_result_free(&result);
+#else
     ASS_Image *imgs = ass_render_frame(renderer, track, ts, &changed);
     mp_sub_packer_pack_ass(ctx->packer, &imgs, 1, changed, !converted, format, res);
+#endif
 
 done:
     // mangle_colors() modifies the color field, so copy the thing _before_.
     res = sub_bitmaps_copy(&ctx->copy_cache, res);
 
-    if (!converted && res)
+    if (!converted && res && res->format == SUBBITMAP_LIBASS)
         mangle_colors(sd, res);
 
     return res;

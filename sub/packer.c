@@ -326,6 +326,81 @@ void mp_sub_packer_pack_ass(struct mp_sub_packer *p, ASS_Image **image_lists,
     p->cached_subs_valid = true;
 }
 
+#ifdef LIBASSMOD_FEATURE_RGBA
+void mp_sub_packer_pack_ass_rgba(struct mp_sub_packer *p, ASS_ImageRGBA *imgs,
+                                 bool image_list_changed, bool video_color_space,
+                                 struct sub_bitmaps *out)
+{
+    if (p->cached_subs_valid && !image_list_changed &&
+        p->cached_subs.format == SUBBITMAP_BGRA)
+    {
+        *out = p->cached_subs;
+        return;
+    }
+
+    *out = (struct sub_bitmaps){.change_id = 1};
+    p->cached_subs_valid = false;
+
+    struct sub_bitmaps res = {
+        .change_id = image_list_changed,
+        .format = SUBBITMAP_BGRA,
+        .parts = p->cached_parts,
+        .video_color_space = video_color_space,
+    };
+
+    for (ASS_ImageRGBA *img = imgs; img; img = img->next) {
+        if (img->w <= 0 || img->h <= 0)
+            continue;
+        MP_TARRAY_GROW(p, p->cached_parts, res.num_parts);
+        res.parts = p->cached_parts;
+        struct sub_bitmap *b = &res.parts[res.num_parts];
+        b->dw = b->w = img->w;
+        b->dh = b->h = img->h;
+        b->x = img->dst_x;
+        b->y = img->dst_y;
+        res.num_parts++;
+    }
+
+    if (!pack(p, &res, IMGFMT_BGRA))
+        return;
+
+    int padding = p->packer->padding;
+    uint8_t *base = res.packed->planes[0];
+    int stride = res.packed->stride[0];
+
+    int n = 0;
+    for (ASS_ImageRGBA *img = imgs; img; img = img->next) {
+        if (img->w <= 0 || img->h <= 0)
+            continue;
+
+        struct sub_bitmap *b = &res.parts[n++];
+        uint8_t *dst = base + b->src_y * stride + b->src_x * 4;
+        uint8_t *src = img->rgba;
+
+        for (int y = 0; y < img->h; y++) {
+            uint8_t *dst_row = dst + y * stride;
+            uint8_t *src_row = src + y * img->stride;
+            for (int x = 0; x < img->w; x++) {
+                dst_row[x * 4 + 0] = src_row[x * 4 + 2];
+                dst_row[x * 4 + 1] = src_row[x * 4 + 1];
+                dst_row[x * 4 + 2] = src_row[x * 4 + 0];
+                dst_row[x * 4 + 3] = src_row[x * 4 + 3];
+            }
+        }
+
+        fill_padding_4(dst, b->w, b->h, stride, padding);
+
+        b->bitmap = dst;
+        b->stride = stride;
+    }
+
+    *out = res;
+    p->cached_subs = res;
+    p->cached_subs.change_id = 0;
+    p->cached_subs_valid = true;
+}
+#endif
+
 #if HAVE_SUBRANDR
 // Pack the images in `res` into a BGRA8 atlas and populate `res->parts`
 // with instances of the images as described by `pass`.
