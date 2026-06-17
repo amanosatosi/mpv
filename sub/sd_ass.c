@@ -23,6 +23,12 @@
 
 #include <libavutil/common.h>
 #include <ass/ass.h>
+#ifdef LIBASSMOD_FEATURE_TAG_IMAGE
+#include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
+#include <libswscale/swscale.h>
+#endif
 
 #include "mpv_talloc.h"
 
@@ -30,10 +36,12 @@
 #include "options/m_config.h"
 #include "options/options.h"
 #include "options/path.h"
+#include "misc/path_utils.h"
 #include "common/common.h"
 #include "common/msg.h"
 #include "demux/demux.h"
 #include "demux/packet_pool.h"
+#include "stream/stream.h"
 #include "video/csputils.h"
 #include "video/mp_image.h"
 #include "dec_sub.h"
@@ -61,6 +69,11 @@ struct sd_ass_priv {
     struct seen_packet *seen_packets;
     int num_seen_packets;
     bool check_animated;
+#ifdef LIBASSMOD_FEATURE_TAG_IMAGE
+    char **tag_image_paths;
+    int num_tag_image_paths;
+    bool tag_images_registered;
+#endif
 };
 
 struct seen_packet {
@@ -155,6 +168,405 @@ static const char *const font_mimetypes[] = {
 };
 
 static const char *const font_exts[] = {".ttf", ".ttc", ".otf", ".otc", NULL};
+
+#ifdef LIBASSMOD_FEATURE_TAG_IMAGE
+static bool tag_image_ext_to_format(const char *name, ASS_TagImageFormat *out_format)
+{
+    bstr root;
+    char *ext = mp_splitext(name, &root);
+    if (!ext)
+        return false;
+    if (strcasecmp(ext, "png") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_PNG;
+        return true;
+    } else if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_JPEG;
+        return true;
+    } else if (strcasecmp(ext, "webp") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_WEBP;
+        return true;
+    }
+    return false;
+}
+
+static bool tag_image_mime_to_format(const char *type, ASS_TagImageFormat *out_format)
+{
+    if (!type)
+        return false;
+    if (strcasecmp(type, "image/png") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_PNG;
+        return true;
+    } else if (strcasecmp(type, "image/jpeg") == 0 ||
+               strcasecmp(type, "image/jpg") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_JPEG;
+        return true;
+    } else if (strcasecmp(type, "image/webp") == 0) {
+        *out_format = ASS_TAG_IMAGE_FORMAT_WEBP;
+        return true;
+    }
+    return false;
+}
+
+static bool attachment_is_tag_image(struct mp_log *log, struct demux_attachment *f,
+                                    ASS_TagImageFormat *out_format)
+{
+    if (!f->name || !f->data || !f->data_size)
+        return false;
+
+    if (tag_image_mime_to_format(f->type, out_format))
+        return true;
+
+    if (tag_image_ext_to_format(f->name, out_format)) {
+        mp_warn(log, "Loading image attachment '%s' with MIME type %s. "
+                "Assuming this is a broken Matroska file, which was "
+                "muxed without setting a correct image MIME type.\n",
+                f->name, f->type ? f->type : "(missing)");
+        return true;
+    }
+
+    return false;
+}
+
+static enum AVCodecID tag_image_format_to_codec_id(ASS_TagImageFormat format)
+{
+    switch (format) {
+    case ASS_TAG_IMAGE_FORMAT_PNG:  return AV_CODEC_ID_PNG;
+    case ASS_TAG_IMAGE_FORMAT_JPEG: return AV_CODEC_ID_MJPEG;
+    case ASS_TAG_IMAGE_FORMAT_WEBP: return AV_CODEC_ID_WEBP;
+    default:                        return AV_CODEC_ID_NONE;
+    }
+}
+
+static bool decode_tag_image_rgba(struct sd *sd, const void *data, size_t size,
+                                  ASS_TagImageFormat format, uint8_t **out_rgba,
+                                  int *out_w, int *out_h, int *out_stride)
+{
+    const int max_dim = 8192;
+    const int64_t max_pixels = 8192LL * 8192LL;
+    bool ok = false;
+    AVCodecContext *avctx = NULL;
+    AVFrame *frame = NULL;
+    AVFrame *rgba = NULL;
+    struct SwsContext *sws = NULL;
+    AVPacket *pkt = NULL;
+
+    *out_rgba = NULL;
+    *out_w = *out_h = *out_stride = 0;
+    if (!data || size == 0 || size > INT_MAX)
+        goto done;
+
+    const AVCodec *codec = avcodec_find_decoder(tag_image_format_to_codec_id(format));
+    if (!codec) {
+        MP_WARN(sd, "No decoder available for ASS tag image.\n");
+        goto done;
+    }
+
+    avctx = avcodec_alloc_context3(codec);
+    frame = av_frame_alloc();
+    rgba = av_frame_alloc();
+    pkt = av_packet_alloc();
+    if (!avctx || !frame || !rgba || !pkt)
+        goto done;
+
+    if (avcodec_open2(avctx, codec, NULL) < 0)
+        goto done;
+
+    if (av_new_packet(pkt, (int)size) < 0)
+        goto done;
+    memcpy(pkt->data, data, size);
+
+    if (avcodec_send_packet(avctx, pkt) < 0 ||
+        avcodec_receive_frame(avctx, frame) < 0)
+        goto done;
+
+    if (frame->width <= 0 || frame->height <= 0 ||
+        frame->width > max_dim || frame->height > max_dim ||
+        (int64_t)frame->width * frame->height > max_pixels)
+    {
+        MP_WARN(sd, "Rejecting oversized ASS tag image: %dx%d.\n",
+                frame->width, frame->height);
+        goto done;
+    }
+
+    sws = sws_getContext(frame->width, frame->height, frame->format,
+                         frame->width, frame->height, AV_PIX_FMT_RGBA,
+                         SWS_BILINEAR, NULL, NULL, NULL);
+    if (!sws)
+        goto done;
+
+    if (av_image_alloc(rgba->data, rgba->linesize, frame->width, frame->height,
+                       AV_PIX_FMT_RGBA, 1) < 0)
+        goto done;
+
+    if (sws_scale(sws, (const uint8_t *const *)frame->data, frame->linesize,
+                  0, frame->height, rgba->data, rgba->linesize) < 1)
+        goto done;
+
+    *out_rgba = rgba->data[0];
+    *out_w = frame->width;
+    *out_h = frame->height;
+    *out_stride = rgba->linesize[0];
+    rgba->data[0] = NULL;
+    ok = true;
+
+done:
+    av_packet_free(&pkt);
+    if (rgba && rgba->data[0])
+        av_freep(&rgba->data[0]);
+    av_frame_free(&rgba);
+    av_frame_free(&frame);
+    sws_freeContext(sws);
+    avcodec_free_context(&avctx);
+    return ok;
+}
+
+static bool string_list_contains(char **list, int num, const char *s)
+{
+    for (int n = 0; n < num; n++) {
+        if (strcmp(list[n], s) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void string_list_add_unique(void *ta_parent, char ***list, int *num, const char *s)
+{
+    if (!s || !s[0] || string_list_contains(*list, *num, s))
+        return;
+    MP_TARRAY_APPEND(ta_parent, *list, *num, talloc_strdup(ta_parent, s));
+}
+
+static bstr ass_tag_image_arg(bstr args)
+{
+    args = bstr_lstrip(args);
+    if (!args.len)
+        return (bstr){0};
+
+    bool quoted = args.start[0] == '"';
+    if (quoted)
+        args = bstr_splice(args, 1, (int)args.len);
+
+    int end = 0;
+    while (end < (int)args.len) {
+        if (quoted) {
+            if (args.start[end] == '"')
+                break;
+        } else if (args.start[end] == ',' || args.start[end] == ')') {
+            break;
+        }
+        end++;
+    }
+
+    return bstr_strip(bstr_splice(args, 0, end));
+}
+
+static void scan_event_tag_images(void *ta_parent, char ***paths, int *num_paths,
+                                  const char *text)
+{
+    if (!text)
+        return;
+
+    for (const char *block = text; (block = strchr(block, '{')); block++) {
+        const char *end = strchr(block, '}');
+        if (!end)
+            break;
+
+        for (const char *p = block + 1; p < end; p++) {
+            if (p[0] != '\\')
+                continue;
+
+            const char *tag = p + 1;
+            if (tag < end && tag[0] >= '1' && tag[0] <= '4')
+                tag++;
+            if (end - tag < 4 || strncmp(tag, "img(", 4) != 0)
+                continue;
+
+            const char *arg_start = tag + 4;
+            bstr arg = ass_tag_image_arg((bstr){(unsigned char *)arg_start,
+                                                end - arg_start});
+            char *path = bstrto0(NULL, arg);
+            string_list_add_unique(ta_parent, paths, num_paths, path);
+            talloc_free(path);
+        }
+    }
+}
+
+static void collect_tag_image_paths(struct sd *sd, void *ta_parent,
+                                    char ***paths, int *num_paths)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    ASS_Track *track = ctx->ass_track;
+
+    *paths = NULL;
+    *num_paths = 0;
+    for (int n = 0; n < track->n_events; n++)
+        scan_event_tag_images(ta_parent, paths, num_paths, track->events[n].Text);
+}
+
+static bool string_lists_equal(char **a, int num_a, char **b, int num_b)
+{
+    if (num_a != num_b)
+        return false;
+    for (int n = 0; n < num_a; n++) {
+        if (!string_list_contains(b, num_b, a[n]))
+            return false;
+    }
+    return true;
+}
+
+static void register_tag_image_key(struct sd *sd, void *ta_parent,
+                                   char ***registered, int *num_registered,
+                                   const char *key, ASS_TagImageFormat format,
+                                   int w, int h, int stride, uint8_t *rgba,
+                                   int *num_ok)
+{
+    if (!key || !key[0] || string_list_contains(*registered, *num_registered, key))
+        return;
+
+    struct sd_ass_priv *ctx = sd->priv;
+    if (ass_set_tag_image_rgba(ctx->ass_renderer, key, format, w, h, stride, rgba) < 0) {
+        MP_WARN(sd, "libassmod failed to register ASS tag image '%s'.\n", key);
+        return;
+    }
+
+    string_list_add_unique(ta_parent, registered, num_registered, key);
+    (*num_ok)++;
+}
+
+static void register_decoded_tag_image(struct sd *sd, void *ta_parent,
+                                       char ***registered,
+                                       int *num_registered, const char *key,
+                                       ASS_TagImageFormat format, const void *data,
+                                       size_t size, int *num_ok,
+                                       const char *extra_key)
+{
+    uint8_t *rgba = NULL;
+    int w = 0, h = 0, stride = 0;
+
+    if (!decode_tag_image_rgba(sd, data, size, format, &rgba, &w, &h, &stride)) {
+        MP_WARN(sd, "Could not decode ASS tag image '%s'.\n", key);
+        return;
+    }
+
+    register_tag_image_key(sd, ta_parent, registered, num_registered, key, format,
+                           w, h, stride, rgba, num_ok);
+
+    if (extra_key)
+        register_tag_image_key(sd, ta_parent, registered, num_registered,
+                               extra_key, format, w, h, stride, rgba, num_ok);
+
+    const char *base = mp_basename(key);
+    if (base && strcmp(base, key) != 0)
+        register_tag_image_key(sd, ta_parent, registered, num_registered, base, format,
+                               w, h, stride, rgba, num_ok);
+
+    MP_VERBOSE(sd, "Registered ASS tag image '%s' (%dx%d).\n", key, w, h);
+    av_free(rgba);
+}
+
+static bool attachment_name_matches_path(struct demux_attachment *f, const char *path)
+{
+    return f->name && path &&
+           (strcmp(f->name, path) == 0 ||
+            strcmp(mp_basename(f->name), path) == 0 ||
+            strcmp(mp_basename(f->name), mp_basename(path)) == 0);
+}
+
+static bool tag_image_path_is_attachment(struct sd *sd, const char *path)
+{
+    if (!sd->attachments)
+        return false;
+    for (int i = 0; i < sd->attachments->num_entries; i++) {
+        struct demux_attachment *f = &sd->attachments->entries[i];
+        if (attachment_name_matches_path(f, path))
+            return true;
+    }
+    return false;
+}
+
+static char *resolve_tag_image_sidecar_path(struct sd *sd, void *ta_parent,
+                                            const char *path)
+{
+    if (!path || !path[0] || mp_is_url(bstr0(path)))
+        return NULL;
+
+    char *resolved = mp_get_user_path(ta_parent, sd->global, path);
+    if (resolved && mp_path_exists(resolved))
+        return resolved;
+
+    MP_VERBOSE(sd, "ASS tag image sidecar '%s' was not found.\n", path);
+    return NULL;
+}
+
+static void add_subtitle_tag_images(struct sd *sd)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    void *tmp = talloc_new(NULL);
+    char **paths = NULL;
+    int num_paths = 0;
+    char **registered = NULL;
+    int num_registered = 0;
+    int num_ok = 0;
+
+    if (!ctx->ass_renderer)
+        goto done;
+
+    collect_tag_image_paths(sd, tmp, &paths, &num_paths);
+    if (ctx->tag_images_registered &&
+        string_lists_equal(paths, num_paths, ctx->tag_image_paths, ctx->num_tag_image_paths))
+        goto done;
+
+    ass_clear_tag_images(ctx->ass_renderer);
+    MP_VERBOSE(sd, "libassmod ASS tag image support: discovered %d sidecar reference(s).\n",
+               num_paths);
+
+    if (sd->attachments) {
+        for (int i = 0; i < sd->attachments->num_entries; i++) {
+            struct demux_attachment *f = &sd->attachments->entries[i];
+            ASS_TagImageFormat format;
+            if (!attachment_is_tag_image(sd->log, f, &format))
+                continue;
+            register_decoded_tag_image(sd, tmp, &registered, &num_registered, f->name,
+                                       format, f->data, f->data_size, &num_ok, NULL);
+        }
+    }
+
+    for (int n = 0; n < num_paths; n++) {
+        ASS_TagImageFormat format;
+        if (tag_image_path_is_attachment(sd, paths[n]))
+            continue;
+        if (!tag_image_ext_to_format(paths[n], &format)) {
+            MP_VERBOSE(sd, "Ignoring ASS tag image '%s' with unsupported extension.\n",
+                       paths[n]);
+            continue;
+        }
+        char *resolved = resolve_tag_image_sidecar_path(sd, tmp, paths[n]);
+        if (!resolved)
+            continue;
+        bstr data = stream_read_file(resolved, tmp, sd->global, 256 * 1024 * 1024);
+        if (!data.start) {
+            MP_VERBOSE(sd, "Could not read ASS tag image sidecar '%s'.\n", resolved);
+            continue;
+        }
+        register_decoded_tag_image(sd, tmp, &registered, &num_registered, paths[n],
+                                   format, data.start, data.len, &num_ok, resolved);
+    }
+
+    talloc_free(ctx->tag_image_paths);
+    ctx->tag_image_paths = NULL;
+    ctx->num_tag_image_paths = 0;
+    for (int n = 0; n < num_paths; n++)
+        string_list_add_unique(ctx, &ctx->tag_image_paths, &ctx->num_tag_image_paths, paths[n]);
+    ctx->tag_images_registered = true;
+
+    MP_VERBOSE(sd, "libassmod registered %d ASS tag image key(s).\n", num_ok);
+
+done:
+    talloc_free(tmp);
+}
+#else
+static void add_subtitle_tag_images(struct sd *sd) { (void)sd; }
+#endif
 
 static bool attachment_is_font(struct mp_log *log, struct demux_attachment *f)
 {
@@ -288,12 +700,21 @@ static void assobjects_init(struct sd *sd)
 
     enable_output(sd, true);
     ass_set_cache_limits(ctx->ass_renderer, sd->opts->sub_glyph_limit, sd->opts->sub_bitmap_max_size);
+    add_subtitle_tag_images(sd);
 }
 
 static void assobjects_destroy(struct sd *sd)
 {
     struct sd_ass_priv *ctx = sd->priv;
 
+#ifdef LIBASSMOD_FEATURE_TAG_IMAGE
+    if (ctx->ass_renderer)
+        ass_clear_tag_images(ctx->ass_renderer);
+    talloc_free(ctx->tag_image_paths);
+    ctx->tag_image_paths = NULL;
+    ctx->num_tag_image_paths = 0;
+    ctx->tag_images_registered = false;
+#endif
     ass_free_track(ctx->ass_track);
     ass_free_track(ctx->shadow_track);
     enable_output(sd, false);
@@ -503,6 +924,8 @@ static void decode(struct sd *sd, struct demux_packet *packet)
         packet->seen = check_packet_seen(sd, packet);
         filter_and_add(sd, packet);
     }
+
+    add_subtitle_tag_images(sd);
 }
 
 // Calculate the height used for scaling subtitle text size so --sub-scale-with-window
