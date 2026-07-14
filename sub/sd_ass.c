@@ -49,6 +49,12 @@
 #include "packer.h"
 #include "sd.h"
 
+#ifdef LIBASSMOD_FEATURE_TAG_IMAGE
+int ass_process_mangetsu_colorcoding_line(ASS_Track *track, const char *name,
+                                          const char *effect, const char *text,
+                                          int is_comment, int is_top_block);
+#endif
+
 struct sd_ass_priv {
     struct ass_library *ass_library;
     struct ass_renderer *ass_renderer;
@@ -172,17 +178,17 @@ static const char *const font_exts[] = {".ttf", ".ttc", ".otf", ".otc", NULL};
 #ifdef LIBASSMOD_FEATURE_TAG_IMAGE
 static bool tag_image_ext_to_format(const char *name, ASS_TagImageFormat *out_format)
 {
-    bstr root;
-    char *ext = mp_splitext(name, &root);
-    if (!ext)
+    bstr ext = mp_get_ext(bstr0(name));
+    if (!ext.len)
         return false;
-    if (strcasecmp(ext, "png") == 0) {
+    if (bstrcasecmp0(ext, "png") == 0) {
         *out_format = ASS_TAG_IMAGE_FORMAT_PNG;
         return true;
-    } else if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) {
+    } else if (bstrcasecmp0(ext, "jpg") == 0 ||
+               bstrcasecmp0(ext, "jpeg") == 0) {
         *out_format = ASS_TAG_IMAGE_FORMAT_JPEG;
         return true;
-    } else if (strcasecmp(ext, "webp") == 0) {
+    } else if (bstrcasecmp0(ext, "webp") == 0) {
         *out_format = ASS_TAG_IMAGE_FORMAT_WEBP;
         return true;
     }
@@ -564,8 +570,163 @@ static void add_subtitle_tag_images(struct sd *sd)
 done:
     talloc_free(tmp);
 }
+
+static bstr next_ass_line(bstr *body)
+{
+    int eol = bstrchr(*body, '\n');
+    bstr line;
+    if (eol < 0) {
+        line = *body;
+        *body = (bstr){0};
+    } else {
+        line = bstr_splice(*body, 0, eol);
+        *body = bstr_cut(*body, eol + 1);
+    }
+    return bstr_strip_linebreaks(line);
+}
+
+static bstr strip_ass_field(bstr field)
+{
+    return bstr_strip(field);
+}
+
+static void get_colorcoding_format_indexes(bstr format, int *name_idx,
+                                           int *effect_idx, int *text_idx)
+{
+    *name_idx = *effect_idx = *text_idx = -1;
+
+    int idx = 0;
+    while (format.len) {
+        bstr field;
+        bstr_split_tok(format, ",", &field, &format);
+        field = strip_ass_field(field);
+
+        if (bstrcasecmp0(field, "Name") == 0 ||
+            bstrcasecmp0(field, "Actor") == 0)
+            *name_idx = idx;
+        else if (bstrcasecmp0(field, "Effect") == 0)
+            *effect_idx = idx;
+        else if (bstrcasecmp0(field, "Text") == 0)
+            *text_idx = idx;
+
+        idx++;
+    }
+}
+
+static bool get_ass_event_field(bstr fields, int wanted_idx, bool rest, bstr *out)
+{
+    for (int idx = 0; fields.len || idx <= wanted_idx; idx++) {
+        if (idx == wanted_idx) {
+            if (rest) {
+                *out = fields;
+            } else {
+                int comma = bstrchr(fields, ',');
+                *out = comma < 0 ? fields : bstr_splice(fields, 0, comma);
+            }
+            return true;
+        }
+
+        int comma = bstrchr(fields, ',');
+        if (comma < 0)
+            return false;
+        fields = bstr_cut(fields, comma + 1);
+    }
+
+    return false;
+}
+
+static bool parse_colorcoding_comment(bstr line, int name_idx, int effect_idx,
+                                      int text_idx, bstr *name, bstr *effect,
+                                      bstr *text)
+{
+    line = bstr_strip(line);
+    if (!bstr_case_startswith(line, bstr0("Comment:")))
+        return false;
+
+    bstr fields = bstr_cut(line, strlen("Comment:"));
+    if (name_idx < 0 || effect_idx < 0 || text_idx < 0)
+        return false;
+    if (!get_ass_event_field(fields, name_idx, false, name) ||
+        !get_ass_event_field(fields, effect_idx, false, effect) ||
+        !get_ass_event_field(fields, text_idx, true, text))
+        return false;
+
+    *name = strip_ass_field(*name);
+    *effect = strip_ass_field(*effect);
+    return name->len > 0 && bstrcasecmp0(*effect, "mangetsu-colorcoding") == 0;
+}
+
+static void process_mangetsu_colorcoding_metadata(struct sd *sd,
+                                                  const char *data, int size)
+{
+    if (!data || size <= 0)
+        return;
+
+    struct sd_ass_priv *ctx = sd->priv;
+    void *tmp = talloc_new(NULL);
+    bstr body = {(unsigned char *)data, size};
+    bool in_events = false;
+    bool have_format = false;
+    bool top_scan_active = false;
+    int name_idx = -1;
+    int effect_idx = -1;
+    int text_idx = -1;
+
+    while (body.len) {
+        bstr line = next_ass_line(&body);
+        bstr stripped = bstr_strip(line);
+
+        if (!stripped.len)
+            continue;
+
+        if (stripped.start[0] == '[') {
+            in_events = bstrcasecmp0(stripped, "[Events]") == 0;
+            have_format = false;
+            top_scan_active = false;
+            continue;
+        }
+
+        if (!in_events)
+            continue;
+
+        if (bstr_case_startswith(stripped, bstr0("Format:"))) {
+            get_colorcoding_format_indexes(bstr_cut(stripped, strlen("Format:")),
+                                           &name_idx, &effect_idx, &text_idx);
+            have_format = true;
+            top_scan_active = true;
+            continue;
+        }
+
+        if (!have_format || !top_scan_active)
+            continue;
+
+        bstr name, effect, text;
+        if (!parse_colorcoding_comment(stripped, name_idx, effect_idx, text_idx,
+                                       &name, &effect, &text)) {
+            top_scan_active = false;
+            continue;
+        }
+
+        char *name0 = bstrdup0(tmp, name);
+        char *effect0 = bstrdup0(tmp, effect);
+        char *text0 = bstrdup0(tmp, text);
+        if (!name0 || !effect0 || !text0 ||
+            ass_process_mangetsu_colorcoding_line(ctx->ass_track, name0, effect0,
+                                                  text0, 1, 1) < 0)
+            MP_WARN(sd, "libassmod failed to process mangetsu colorcoding metadata.\n");
+    }
+
+    talloc_free(tmp);
+}
 #else
 static void add_subtitle_tag_images(struct sd *sd) { (void)sd; }
+static void process_mangetsu_colorcoding_metadata(struct sd *sd,
+                                                  const char *data, int size)
+{
+    (void)sd;
+    (void)data;
+    (void)size;
+}
 #endif
 
 static bool attachment_is_font(struct mp_log *log, struct demux_attachment *f)
@@ -685,8 +846,10 @@ static void assobjects_init(struct sd *sd)
         extradata = lavc_conv_get_extradata(ctx->converter);
         extradata_size = extradata ? strlen(extradata) : 0;
     }
-    if (extradata)
+    if (extradata) {
         ass_process_codec_private(ctx->ass_track, extradata, extradata_size);
+        process_mangetsu_colorcoding_metadata(sd, extradata, extradata_size);
+    }
 
     mp_ass_add_default_styles(sd, ctx->ass_track, opts, shared_opts);
 

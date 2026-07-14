@@ -66,8 +66,8 @@ which bootstraps a MinGW-w64 toolchain and builds mpv along with its dependencie
 
    cat <<EOF > subprojects/libass.wrap
    [wrap-git]
-   revision = master
-   url = https://github.com/libass/libass
+   revision = mangetsu
+   url = https://github.com/amanosatosi/libassmod
    depth = 1
    EOF
 

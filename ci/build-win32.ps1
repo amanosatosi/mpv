@@ -241,8 +241,8 @@ $projects = @(
     },
     @{
         Path = "$subprojects/libass.wrap"
-        URL = "https://github.com/libass/libass"
-        Revision = "master"
+        URL = "https://github.com/amanosatosi/libassmod"
+        Revision = "mangetsu"
     },
     @{
         Path = "$subprojects/libplacebo.wrap"
