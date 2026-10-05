@@ -6,6 +6,8 @@ on:
       - master
       - ci
       - 'release/**'
+    tags:
+      - 'v0.*'
     paths-ignore:
       - 'DOCS/**'
       - 'TOOLS/lua/**'
@@ -129,6 +131,66 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ env.TARGET }}-${{ steps.get_time.outputs.timestamp }}
 
+  mingw64-full:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [win64, winarm64]
+        variant: [gpl, lgpl]
+    container:
+      image: ghcr.io/btbn/ffmpeg-builds/${{ matrix.target }}-${{ matrix.variant }}:latest
+      env:
+        WINEPREFIX: /tmp/wine
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build
+        id: build
+        run: |
+          ./ci/build-mingw64-full.sh
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/meson-log.txt
+
+      - name: Functional test
+        if: ${{ matrix.target == 'win64' }}
+        run: |
+          cd artifact && wine ./mpv.com -v --no-config
+
+      - name: Run meson tests
+        if: ${{ matrix.target == 'win64' }}
+        id: tests
+        run: |
+          meson test -C build
+
+      - name: Print meson test log
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/testlog.txt
+
+      - name: Artifact name
+        id: artifact
+        run: |
+          VERSION_FILE=$(find . -path "*/common/version.h" -type f | head -n 1)
+          VER=$(grep VERSION "$VERSION_FILE" | cut -d'"' -f2)
+          PR=${{ github.event.pull_request.number && format('-pr{0}', github.event.pull_request.number) || '' }}
+          echo "mpv=mpv-$VER$PR-${{ github.run_id }}-$FFBUILD_TOOLCHAIN-full" >> "$GITHUB_OUTPUT"
+          echo "libmpv=libmpv-$VER$PR-${{ github.run_id }}-$FFBUILD_TOOLCHAIN-${{ matrix.variant }}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ matrix.variant == 'gpl' }}
+        with:
+          name: ${{ steps.artifact.outputs.mpv }}
+          path: artifact/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.artifact.outputs.libmpv }}
+          path: artifact-libmpv/*
+
   win32:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -137,7 +199,7 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             arch: "x64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
           - target: aarch64-pc-windows-msvc
             arch: "arm64"
             os: "windows-11-arm"
@@ -275,9 +337,11 @@ jobs:
           - os: "macos-14"
             arch: "arm"
             xcode: "Xcode_15.0"
+            homebrew: "b1d3cbaeb724947c97bf0e334adb3db56e4b5438"
           - os: "macos-15"
             arch: "arm"
           - os: "macos-15-intel"
+            homebrew: "956fbd2598f7b0bc3c7ef72edaa622e19415f6c9"
           - os: "macos-26"
             arch: "arm"
           - os: "macos-26"
@@ -306,14 +370,16 @@ jobs:
           if [[ -n "${{ matrix.homebrew }}" ]]; then
             export HOMEBREW_NO_AUTO_UPDATE=1
             cd "$(brew --repo homebrew/core)"
+            git fetch --depth=1 origin ${{ matrix.homebrew }}
             git checkout --force ${{ matrix.homebrew }}
           else
             brew update
           fi
           if brew list ffmpeg &> /dev/null; then brew unlink ffmpeg; fi
+          if brew list openssl@1.1 &> /dev/null; then brew rm openssl@1.1; fi
           brew install -q autoconf automake curl pkgconf libtool python freetype fribidi little-cms2 \
             luajit libass ffmpeg-full meson rust uchardet mujs libplacebo molten-vk vulkan-loader vulkan-headers \
-            libarchive libbluray libcaca libcdio-paranoia libdvdnav rubberband zimg
+            libarchive libbluray libcaca libcdio-paranoia libdvdnav libdvdread rubberband vapoursynth zimg
           brew link ffmpeg-full
 
       - name: Build with meson
@@ -324,6 +390,7 @@ jobs:
           TRAVIS_OS_NAME: "${{ matrix.os }}"
           SWIFT_FLAGS: "${{ matrix.swift }}"
           MACOSX_DEPLOYMENT_TARGET: "${{ matrix.target }}"
+          MACOS_ARCH: "${{ matrix.arch }}"
 
       - name: Create App Bundle
         if: ${{ matrix.arch != 'test' }}
@@ -485,104 +552,150 @@ jobs:
   openbsd:
     runs-on: ubuntu-latest # until https://github.com/actions/runner/issues/385
     timeout-minutes: 15 # avoid any weirdness with the VM
+    defaults:
+      run:
+        shell: cpa.sh {0} --sync-files none
     steps:
-    - uses: actions/checkout@v7
-    - name: Test in OpenBSD VM
-      uses: cross-platform-actions/action@v1.3.0
-      with:
-        operating_system: openbsd
-        version: '7.8'
+      - uses: actions/checkout@v7
+
+      - name: Start OpenBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: openbsd
+          version: '7.8'
+          sync_files: runner-to-vm
+
+      - name: Install dependencies
         run: |
-            sudo pkg_add -U \
-                cmake \
-                curl \
-                ffmpeg \
-                git \
-                libarchive \
-                libbluray \
-                libcaca \
-                libcdio-paranoia \
-                libdvdnav \
-                libiconv \
-                libplacebo \
-                libv4l \
-                libxkbcommon \
-                luajit \
-                meson \
-                openal \
-                pkgconf \
-                pulseaudio \
-                python3 \
-                rubberband \
-                rust \
-                sdl2 \
-                shaderc \
-                spirv-cross \
-                spirv-headers \
-                uchardet \
-                vulkan-loader \
-                vulkan-headers \
-                zimg
-            ./ci/build-openbsd.sh
-            if ! meson test -C build; then
-                cat ./build/meson-logs/testlog.txt
-                exit 1
-            fi
+          sudo pkg_add -U \
+              cmake \
+              curl \
+              ffmpeg \
+              git \
+              libarchive \
+              libbluray \
+              libcaca \
+              libcdio-paranoia \
+              libdvdnav \
+              libiconv \
+              libplacebo \
+              libv4l \
+              libxkbcommon \
+              luajit \
+              meson \
+              openal \
+              pkgconf \
+              pulseaudio \
+              python3 \
+              rubberband \
+              rust \
+              sdl2 \
+              shaderc \
+              spirv-cross \
+              spirv-headers \
+              uchardet \
+              vulkan-loader \
+              vulkan-headers \
+              zimg
+
+      - name: Build with meson
+        id: build
+        run: |
+          ./ci/build-openbsd.sh
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/meson-log.txt
+
+      - name: Run meson tests
+        id: tests
+        run: |
+          meson test -C build
+
+      - name: Print meson test log
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/testlog.txt
 
   freebsd:
     runs-on: ubuntu-latest # until https://github.com/actions/runner/issues/385
     timeout-minutes: 15 # avoid any weirdness with the VM
+    defaults:
+      run:
+        shell: cpa.sh {0} --sync-files none
     steps:
-    - uses: actions/checkout@v7
-    - name: Test in FreeBSD VM
-      uses: cross-platform-actions/action@v1.3.0
-      with:
-        operating_system: freebsd
-        version: '15.1'
+      - uses: actions/checkout@v7
+
+      - name: Start FreeBSD VM
+        uses: cross-platform-actions/action@v1.6.0
+        with:
+          operating_system: freebsd
+          version: '15.1'
+          sync_files: runner-to-vm
+
+      - name: Install dependencies
         run: |
-            sudo pkg update
-            sudo pkg install -y \
-                alsa-lib \
-                cmake \
-                curl \
-                evdev-proto \
-                ffmpeg \
-                git \
-                iconv \
-                jackit \
-                libarchive \
-                libbluray \
-                libcaca \
-                libcdio-paranoia \
-                libdvdnav \
-                libdisplay-info \
-                libplacebo \
-                libXinerama \
-                libxkbcommon \
-                libXpresent \
-                libXv \
-                luajit \
-                meson \
-                mujs \
-                openal-soft \
-                pipewire \
-                pkgconf \
-                pulseaudio \
-                python3 \
-                rubberband \
-                rust \
-                sekrit-twc-zimg \
-                sdl2 \
-                sndio \
-                uchardet \
-                v4l_compat \
-                vulkan-headers \
-                wayland-protocols
-            ./ci/build-freebsd.sh
-            if ! meson test -C build; then
-                cat ./build/meson-logs/testlog.txt
-                exit 1
-            fi
+          sudo pkg update
+          sudo pkg install -y \
+              alsa-lib \
+              cmake \
+              curl \
+              evdev-proto \
+              ffmpeg \
+              git \
+              iconv \
+              jackit \
+              libarchive \
+              libbluray \
+              libcaca \
+              libcdio-paranoia \
+              libdvdnav \
+              libdvdread \
+              libdisplay-info \
+              libplacebo \
+              libXinerama \
+              libxkbcommon \
+              libXpresent \
+              libXv \
+              luajit \
+              meson \
+              mujs \
+              openal-soft \
+              pipewire \
+              pkgconf \
+              pulseaudio \
+              python3 \
+              rubberband \
+              rust \
+              sekrit-twc-zimg \
+              sdl2 \
+              sndio \
+              uchardet \
+              v4l_compat \
+              vapoursynth \
+              vulkan-headers \
+              wayland-protocols
+
+      - name: Build with meson
+        id: build
+        run: |
+          ./ci/build-freebsd.sh
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/meson-log.txt
+
+      - name: Run meson tests
+        id: tests
+        run: |
+          meson test -C build
+
+      - name: Print meson test log
+        if: ${{ failure() && steps.tests.outcome == 'failure' }}
+        run: |
+          cat ./build/meson-logs/testlog.txt
 
   msys2:
     runs-on: ${{ matrix.os }}
@@ -591,21 +704,21 @@ jobs:
       matrix:
         include:
           - sys: "clang64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
             auto-var-init: "uninitialized"
           - sys: "clang64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
             asan: true
           - sys: "clang64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
             auto-var-init: "zero"
           - sys: "clang64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
             auto-var-init: "pattern"
           - sys: "mingw64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
           - sys: "ucrt64"
-            os: "windows-2025-vs2026"
+            os: "windows-2025"
           - sys: "clangarm64"
             os: "windows-11-arm"
     defaults:
@@ -636,6 +749,7 @@ jobs:
             libass:p
             libcdio-paranoia:p
             libdvdnav:p
+            libdvdread:p
             libjpeg-turbo:p
             libplacebo:p
             lua51:p
