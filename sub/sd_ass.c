@@ -75,6 +75,11 @@ struct sd_ass_priv {
     struct seen_packet *seen_packets;
     int num_seen_packets;
     bool check_animated;
+#if defined(LIBASSMOD_FEATURE_BLEND_BGRA) && \
+    defined(LIBASSMOD_FEATURE_BLEND_TRACK_QUERY)
+    uint8_t *blend_alpha;
+    size_t blend_alpha_size;
+#endif
 #ifdef LIBASSMOD_FEATURE_TAG_IMAGE
     char **tag_image_paths;
     int num_tag_image_paths;
@@ -1389,6 +1394,108 @@ done:
     return res;
 }
 
+#if defined(LIBASSMOD_FEATURE_BLEND_BGRA) && \
+    defined(LIBASSMOD_FEATURE_BLEND_TRACK_QUERY)
+static bool needs_bgra_composite(struct sd *sd)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    if (!sd->opts->ass_enabled ||
+        sd->shared_opts->ass_style_override[sd->order] == ASS_STYLE_OVERRIDE_STRIP)
+        return false;
+    return ctx->ass_track && ass_track_has_blend(ctx->ass_track);
+}
+
+static int composite_bgra(struct sd *sd, struct mp_osd_res dim, double pts,
+                          struct mp_image *dst)
+{
+    struct sd_ass_priv *ctx = sd->priv;
+    struct mp_subtitle_opts *opts = sd->opts;
+    struct mp_subtitle_shared_opts *shared_opts = sd->shared_opts;
+
+    if (!dst || dst->imgfmt != IMGFMT_BGRA || !ctx->ass_renderer ||
+        pts == MP_NOPTS_VALUE)
+        return -1;
+
+    if (opts->sub_forced_events_only)
+        return 0;
+
+    bool converted = ctx->is_converted && !lavc_conv_is_styled(ctx->converter);
+    ASS_Track *track = ctx->ass_track;
+    ASS_Renderer *renderer = ctx->ass_renderer;
+
+    struct mp_osd_res old_osd = ctx->osd;
+    ctx->osd = dim;
+
+    double scale = dim.display_par;
+    if (!converted && (!shared_opts->ass_style_override[sd->order] ||
+                       opts->ass_use_video_data >= 1))
+    {
+        double par = opts->ass_video_aspect > 0 ?
+                     opts->ass_video_aspect :
+                     ctx->video_params.p_w / (double)ctx->video_params.p_h;
+        if (isnormal(par))
+            scale *= par;
+    }
+
+    if (!ctx->ass_configured || !osd_res_equals(old_osd, ctx->osd)) {
+        configure_ass(sd, &dim, converted, track);
+        ctx->ass_configured = true;
+    }
+    ass_set_pixel_aspect(renderer, scale);
+    if (!converted && (!shared_opts->ass_style_override[sd->order] ||
+                       opts->ass_use_video_data >= 2))
+    {
+        ass_set_storage_size(renderer, ctx->video_params.w, ctx->video_params.h);
+    } else {
+        ass_set_storage_size(renderer, 0, 0);
+    }
+
+    long long ts = find_timestamp(sd, pts);
+    int changed = 0;
+    ASS_RenderResult result = ass_render_frame_compat(renderer, track, ts, &changed);
+
+    // A blend-bearing track can have ordinary frames too. Let the generic
+    // bitmap path handle those instead of forcing a second RGBA conversion.
+    if (!result.use_rgba || !result.imgs_rgba) {
+        ass_render_result_free(&result);
+        return 1;
+    }
+
+    size_t pixels = (size_t) dst->w * dst->h;
+    if (dst->h && pixels / (size_t) dst->h != (size_t) dst->w) {
+        ass_render_result_free(&result);
+        return -1;
+    }
+    if (ctx->blend_alpha_size < pixels) {
+        uint8_t *alpha = talloc_realloc_size(ctx, ctx->blend_alpha, pixels);
+        if (!alpha) {
+            ass_render_result_free(&result);
+            return -1;
+        }
+        ctx->blend_alpha = alpha;
+        ctx->blend_alpha_size = pixels;
+    }
+
+    for (int y = 0; y < dst->h; y++) {
+        const uint8_t *row = dst->planes[0] + (ptrdiff_t) y * dst->stride[0];
+        for (int x = 0; x < dst->w; x++)
+            ctx->blend_alpha[(size_t) y * dst->w + x] = row[x * 4 + 3];
+    }
+
+    int rc = ass_composite_images_bgra(result.imgs_rgba, dst->planes[0],
+                                        dst->w, dst->h, dst->stride[0]);
+
+    for (int y = 0; y < dst->h; y++) {
+        uint8_t *row = dst->planes[0] + (ptrdiff_t) y * dst->stride[0];
+        for (int x = 0; x < dst->w; x++)
+            row[x * 4 + 3] = ctx->blend_alpha[(size_t) y * dst->w + x];
+    }
+
+    ass_render_result_free(&result);
+    return rc == 0 ? 0 : -1;
+}
+#endif
+
 #define MAX_BUF_SIZE 1024 * 1024
 #define MIN_EXPAND_SIZE 4096
 
@@ -1705,6 +1812,11 @@ const struct sd_functions sd_ass = {
     .init = init,
     .decode = decode,
     .get_bitmaps = get_bitmaps,
+#if defined(LIBASSMOD_FEATURE_BLEND_BGRA) && \
+    defined(LIBASSMOD_FEATURE_BLEND_TRACK_QUERY)
+    .needs_bgra_composite = needs_bgra_composite,
+    .composite_bgra = composite_bgra,
+#endif
     .get_text = get_text,
     .get_times = get_times,
     .get_lines = get_lines,

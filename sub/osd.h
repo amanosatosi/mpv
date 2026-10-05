@@ -245,6 +245,11 @@ void osd_draw_on_image_p(struct osd_state *osd, struct mp_osd_res res,
                          double video_pts, int draw_flags,
                          struct mp_image_pool *pool, struct mp_image *dest);
 
+bool osd_has_bgra_sub_compositor(struct osd_state *osd);
+bool osd_draw_subs_on_bgra_p(struct osd_state *osd, struct mp_osd_res res,
+                             double video_pts, struct mp_image_pool *pool,
+                             struct mp_image *dest);
+
 void osd_resize(struct osd_state *osd, struct mp_osd_res res);
 
 struct mp_image_params;

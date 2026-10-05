@@ -14,6 +14,7 @@ struct demux_packet;
 struct mp_recorder_sink;
 struct dec_sub;
 struct sd;
+struct mp_image;
 
 enum sd_ctrl {
     SD_CTRL_SUB_STEP,
@@ -63,6 +64,9 @@ void sub_read_packets(struct dec_sub *sub, double video_pts, bool force,
                       bool *packets_read, bool *sub_updated);
 struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
                                     int format, double pts);
+bool sub_needs_bgra_composite(struct dec_sub *sub);
+int sub_composite_bgra(struct dec_sub *sub, struct mp_osd_res dim,
+                       double pts, struct mp_image *dst);
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type);
 char *sub_ass_get_extradata(struct dec_sub *sub);
 struct sd_times sub_get_times(struct dec_sub *sub, double pts);

@@ -439,6 +439,35 @@ struct sub_bitmaps *sub_get_bitmaps(struct dec_sub *sub, struct mp_osd_res dim,
     return res;
 }
 
+bool sub_needs_bgra_composite(struct dec_sub *sub)
+{
+    mp_mutex_lock(&sub->lock);
+    bool res = sub->sd->driver->needs_bgra_composite &&
+               sub->sd->driver->needs_bgra_composite(sub->sd);
+    mp_mutex_unlock(&sub->lock);
+    return res;
+}
+
+int sub_composite_bgra(struct dec_sub *sub, struct mp_osd_res dim,
+                       double pts, struct mp_image *dst)
+{
+    mp_mutex_lock(&sub->lock);
+
+    pts = pts_to_subtitle(sub, pts);
+    sub->last_vo_pts = pts;
+    update_segment(sub);
+
+    int res = -1;
+    if (!(sub->end != MP_NOPTS_VALUE && pts >= sub->end) &&
+        sub->sd->driver->composite_bgra)
+    {
+        res = sub->sd->driver->composite_bgra(sub->sd, dim, pts, dst);
+    }
+
+    mp_mutex_unlock(&sub->lock);
+    return res;
+}
+
 // The returned string is talloc'ed.
 char *sub_get_text(struct dec_sub *sub, double pts, enum sd_text_type type)
 {

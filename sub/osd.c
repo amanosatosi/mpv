@@ -40,6 +40,7 @@
 #include "dec_sub.h"
 #include "img_convert.h"
 #include "draw_bmp.h"
+#include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 
@@ -489,6 +490,100 @@ void osd_draw_on_image_p(struct osd_state *osd, struct mp_osd_res res,
     mp_mutex_unlock(&osd->lock);
 
     talloc_free(list);
+}
+
+bool osd_has_bgra_sub_compositor(struct osd_state *osd)
+{
+    bool needed = false;
+
+    mp_mutex_lock(&osd->lock);
+    struct osd_object *primary = osd->objs[OSDTYPE_SUB];
+    struct osd_object *secondary = osd->objs[OSDTYPE_SUB2];
+
+    if (primary->sub && sub_is_primary_visible(primary->sub) &&
+        sub_needs_bgra_composite(primary->sub))
+    {
+        needed = true;
+    } else if (secondary->sub && sub_is_secondary_visible(secondary->sub) &&
+               sub_needs_bgra_composite(secondary->sub))
+    {
+        needed = true;
+    }
+    mp_mutex_unlock(&osd->lock);
+
+    return needed;
+}
+
+bool osd_draw_subs_on_bgra_p(struct osd_state *osd, struct mp_osd_res res,
+                             double video_pts, struct mp_image_pool *pool,
+                             struct mp_image *dest)
+{
+    if (dest->imgfmt != IMGFMT_BGRA)
+        return false;
+    if (!mp_image_pool_make_writeable(pool, dest))
+        return false;
+
+    double force_video_pts = atomic_load(&osd->force_video_pts);
+    if (force_video_pts != MP_NOPTS_VALUE)
+        video_pts = force_video_pts;
+
+    bool ok = true;
+    mp_mutex_lock(&osd->lock);
+
+    if (!osd->draw_cache)
+        osd->draw_cache = mp_draw_sub_alloc(osd, osd->global);
+
+    int types[] = {OSDTYPE_SUB, OSDTYPE_SUB2};
+    for (int n = 0; n < MP_ARRAY_SIZE(types); n++) {
+        struct osd_object *obj = osd->objs[types[n]];
+        if (!obj->sub)
+            continue;
+        if (obj->type == OSDTYPE_SUB && !sub_is_primary_visible(obj->sub))
+            continue;
+        if (obj->type == OSDTYPE_SUB2 && !sub_is_secondary_visible(obj->sub))
+            continue;
+
+        check_obj_resize(osd, res, obj);
+
+        if (sub_needs_bgra_composite(obj->sub)) {
+            stats_time_start(osd->stats, "mangetsu-blend");
+            int r = sub_composite_bgra(obj->sub, obj->vo_res, video_pts, dest);
+            stats_time_end(osd->stats, "mangetsu-blend");
+            if (r == 0)
+                continue;
+            if (r < 0)
+                MP_WARN(osd, "Mangetsu destination-aware blend failed; "
+                             "using the normal subtitle fallback.\n");
+        }
+
+        struct sub_bitmaps *imgs =
+            render_object(osd, obj, res, video_pts, mp_draw_sub_formats);
+        if (!imgs || !imgs->num_parts) {
+            talloc_free(imgs);
+            continue;
+        }
+
+        struct sub_bitmaps *items[] = {imgs};
+        struct sub_bitmap_list list = {
+            .change_id = imgs->change_id,
+            .w = res.w,
+            .h = res.h,
+            .items = items,
+            .num_items = 1,
+        };
+
+        stats_time_start(osd->stats, "draw-bmp");
+        if (!mp_draw_sub_bitmaps(osd->draw_cache, dest, &list)) {
+            MP_WARN(osd, "Failed rendering subtitle fallback.\n");
+            ok = false;
+        }
+        stats_time_end(osd->stats, "draw-bmp");
+        talloc_free(imgs);
+    }
+
+    talloc_steal(osd, osd->draw_cache);
+    mp_mutex_unlock(&osd->lock);
+    return ok;
 }
 
 // Setup the OSD resolution to render into an image with the given parameters.
