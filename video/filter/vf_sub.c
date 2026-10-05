@@ -33,6 +33,7 @@
 #include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
+#include "video/filter/vf_sub.h"
 #include "sub/osd.h"
 #include "sub/dec_sub.h"
 
@@ -162,3 +163,149 @@ const struct mp_user_filter_entry vf_sub = {
     },
     .create = vf_sub_create,
 };
+
+
+struct mangetsu_blend_priv {
+    struct mp_image_pool *pool;
+    struct mp_sws_context *sws;
+    bool owns_sub_filter;
+};
+
+static void mangetsu_blend_release_osd(struct mp_filter *f)
+{
+    struct mangetsu_blend_priv *priv = f->priv;
+    if (!priv->owns_sub_filter)
+        return;
+
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    struct osd_state *osd = info ? info->osd : NULL;
+    if (osd)
+        osd_set_render_subs_in_filter(osd, false);
+    priv->owns_sub_filter = false;
+}
+
+static void mangetsu_blend_process(struct mp_filter *f)
+{
+    struct mangetsu_blend_priv *priv = f->priv;
+
+    if (!mp_pin_can_transfer_data(f->ppins[1], f->ppins[0]))
+        return;
+
+    struct mp_frame frame = mp_pin_out_read(f->ppins[0]);
+    if (mp_frame_is_signaling(frame)) {
+        mp_pin_in_write(f->ppins[1], frame);
+        return;
+    }
+    if (frame.type != MP_FRAME_VIDEO)
+        goto error;
+
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    struct osd_state *osd = info ? info->osd : NULL;
+    if (!osd)
+        goto passthrough;
+
+    bool needed = osd_has_bgra_sub_compositor(osd);
+    if (!needed) {
+        mangetsu_blend_release_osd(f);
+        goto passthrough;
+    }
+
+    // A user-specified vf=sub owns subtitle-in-video rendering already.
+    if (!priv->owns_sub_filter && osd_get_render_subs_in_filter(osd))
+        goto passthrough;
+
+    if (!priv->owns_sub_filter) {
+        osd_set_render_subs_in_filter(osd, true);
+        priv->owns_sub_filter = true;
+        MP_VERBOSE(f, "Mangetsu \\blend detected; enabling destination-aware "
+                      "BGRA subtitle composition.\n");
+    }
+
+    struct mp_image *mpi = frame.data;
+
+    if (mpi->hwctx) {
+        struct mp_image *downloaded = mp_image_hw_download(mpi, priv->pool);
+        if (!downloaded) {
+            MP_ERR(f, "Mangetsu \\blend requires downloading the video frame.\n");
+            goto error;
+        }
+        mp_frame_unref(&frame);
+        mpi = downloaded;
+        frame = (struct mp_frame){MP_FRAME_VIDEO, mpi};
+    }
+
+    if (mpi->imgfmt != IMGFMT_BGRA) {
+        struct mp_image *bgra =
+            mp_image_pool_get(priv->pool, IMGFMT_BGRA, mpi->w, mpi->h);
+        if (!bgra)
+            goto error;
+
+        mp_image_copy_attributes(bgra, mpi);
+        mp_image_setfmt(bgra, IMGFMT_BGRA);
+        mp_image_params_guess_csp(&bgra->params);
+
+        if (mp_sws_scale(priv->sws, bgra, mpi) < 0) {
+            mp_image_unrefp(&bgra);
+            MP_ERR(f, "Failed converting video to BGRA for Mangetsu \\blend.\n");
+            goto error;
+        }
+
+        mp_frame_unref(&frame);
+        mpi = bgra;
+        frame = (struct mp_frame){MP_FRAME_VIDEO, mpi};
+    }
+
+    struct mp_osd_res dim = {
+        .w = mpi->w,
+        .h = mpi->h,
+        .display_par = mpi->params.p_w / (double) mpi->params.p_h,
+    };
+
+    if (!osd_draw_subs_on_bgra_p(osd, dim, mpi->pts, priv->pool, mpi)) {
+        MP_ERR(f, "Mangetsu \\blend subtitle composition failed.\n");
+        goto error;
+    }
+
+passthrough:
+    mp_pin_in_write(f->ppins[1], frame);
+    return;
+
+error:
+    mangetsu_blend_release_osd(f);
+    mp_frame_unref(&frame);
+    mp_filter_internal_mark_failed(f);
+}
+
+static void mangetsu_blend_destroy(struct mp_filter *f)
+{
+    mangetsu_blend_release_osd(f);
+}
+
+static const struct mp_filter_info mangetsu_blend_filter = {
+    .name = "mangetsu-blend",
+    .process = mangetsu_blend_process,
+    .destroy = mangetsu_blend_destroy,
+    .priv_size = sizeof(struct mangetsu_blend_priv),
+};
+
+struct mp_filter *mp_mangetsu_blend_create(struct mp_filter *parent)
+{
+    struct mp_filter *f = mp_filter_create(parent, &mangetsu_blend_filter);
+    if (!f)
+        return NULL;
+
+    mp_filter_add_pin(f, MP_PIN_IN, "in");
+    mp_filter_add_pin(f, MP_PIN_OUT, "out");
+
+    struct mangetsu_blend_priv *priv = f->priv;
+    priv->pool = mp_image_pool_new(priv);
+    priv->sws = mp_sws_alloc(priv);
+    if (!priv->pool || !priv->sws) {
+        talloc_free(f);
+        return NULL;
+    }
+    priv->sws->log = f->log;
+    mp_sws_enable_cmdline_opts(priv->sws, f->global);
+
+    return f;
+}

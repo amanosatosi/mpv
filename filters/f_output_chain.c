@@ -5,6 +5,7 @@
 #include "options/m_config.h"
 #include "options/m_option.h"
 #include "video/out/vo.h"
+#include "video/filter/vf_sub.h"
 
 #include "filter_internal.h"
 
@@ -721,6 +722,13 @@ static void create_video_things(struct chain *p)
     f = create_wrapper_filter(p);
     f->name = "autorotate";
     f->f = mp_autorotate_create(f->wrapper);
+    if (!f->f)
+        abort();
+    MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, f);
+
+    f = create_wrapper_filter(p);
+    f->name = "mangetsu-blend";
+    f->f = mp_mangetsu_blend_create(f->wrapper);
     if (!f->f)
         abort();
     MP_TARRAY_APPEND(p, p->post_filters, p->num_post_filters, f);

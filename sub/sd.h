@@ -36,6 +36,8 @@ struct sd {
     bool preload_ok;
 };
 
+struct mp_image;
+
 struct sd_functions {
     const char *name;
     bool accept_packets_in_advance;
@@ -50,6 +52,9 @@ struct sd_functions {
 
     struct sub_bitmaps *(*get_bitmaps)(struct sd *sd, struct mp_osd_res dim,
                                        int format, double pts);
+    bool (*needs_bgra_composite)(struct sd *sd);
+    int (*composite_bgra)(struct sd *sd, struct mp_osd_res dim, double pts,
+                          struct mp_image *dst);
     char *(*get_text)(struct sd *sd, double pts, enum sd_text_type type);
     struct sd_times (*get_times)(struct sd *sd, double pts);
     struct sub_lines *(*get_lines)(struct sd *sd);
