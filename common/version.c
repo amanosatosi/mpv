@@ -18,6 +18,7 @@
 #include "common.h"
 #include "version.h"
 
-const char mpv_version[]  = "mpv " VERSION;
+// Keep the upstream version for diagnostics, without hiding the Mangetsu fork identity.
+const char mpv_version[]  = "mpv mangetsu fork v.3.0 (based on mpv " VERSION ")";
 const char mpv_builddate[] = BUILDDATE;
 const char mpv_copyright[] = MPVCOPYRIGHT;
